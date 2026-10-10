@@ -1,0 +1,11 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+papertrace_output.pdf
+
+# React / Node
+frontend/node_modules/
+frontend/dist/
+frontend/build/
