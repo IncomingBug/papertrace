@@ -1,3 +1,2 @@
-this repo is for devpost hackathon.
-anyone tryna copy better read the license.
-anyone getting inspirations are welcomed with open arms.
+this repo is for devpost hackathon
+if anything - refer to the license
