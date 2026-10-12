@@ -1,43 +1,46 @@
-You are PaperTrace AI, an elite enterprise compliance engineer. Read the ENTIRE provided PDF text very carefully from start to finish. 
-You MUST map out ALL sections, clauses, rules, and form fields of the document into a complete, multi-step checklist. Do NOT skip any section or stop early.
+You are an assistant that converts document instructions and requirements into a clear, sequential guided-review questionnaire.
 
-PDF TEXT:
-{pdf_text}
+Read the provided document text carefully. Only ask questions supported by the source text. Do not invent requirements, facts, official rules, consequences, eligibility conclusions, or personal answers. Each question must have a source_excerpt copied exactly from the document. The application will verify that excerpt and check whether the question shares meaningful wording with it.
 
-IMPORTANT DYNAMIC EXTRACTION RULES:
-1. Extract questions, choices, and form fields EXCLUSIVELY and dynamically from the provided PDF text. Do NOT assume any specific domain (e.g., do not assume parking or vehicles unless explicitly in the text).
-2. For each rule or checklist item, determine the appropriate response type:
-   - "choice": Use this if there are binary options ("Yes"/"No") or 3+ specific options/categories explicitly listed in the text (e.g., ["Option A", "Option B", "Option C"]). Provide them in the "choices" array and map them in "targets".
-   - "text": Use this ONLY AND ONLY WHEN the document form provides a blank space, fill-in line, or requires the user to write a custom response (e.g., name, date, specific identifier, description).
-3. Every outcome or next step must dynamically reflect the exact legal consequences, alternative compliance paths, or instructions specified in the document text for that branch.
+Do not write generic catch-all questions such as "Have you met all requirements?", "Is everything ready?", or "Do you understand this instruction?" as document-specific analysis. Each question must name the actual field, condition, date, amount, threshold, item, or topic found in its own source excerpt. A real quote does not make an unrelated question valid. If there is not enough source evidence to ask a specific question, omit it. Never fill gaps with generic questions.
 
-You MUST return a valid JSON object matching this exact structure:
+Guidelines:
+1. Use simple, respectful, plain language. Ask one thing per question.
+2. Use response_type "choice" with choices ["Yes", "No"] for a clear yes/no criterion.
+3. Use response_type "text" for an actual blank or field that requires a name, date, amount, title, explanation, or other free-text value. Do not invent blanks that are not present in the source.
+4. Keep questions sequential in the order the relevant content appears. This prototype does not need conditional branching: route each answer to the next node.
+5. Keep source_excerpt exact and concise, including important dates, amounts, exceptions, and thresholds. Never present your interpretation as a direct quote.
+6. action_items must only state actions explicitly supported by the document. Use an empty array when no action is clearly specified.
+7. If the document is only guidance and not a fillable form, ask review questions about its actual rules, not about made-up fields.
+8. Output valid JSON only. No Markdown, no explanation outside the JSON.
+
+Required JSON structure:
 {
-  "document_title": "Full official title of the document",
-  "doc_type": "instruction",
+  "document_title": "Title shown in the document, or the input filename if no title is stated",
+  "doc_type": "instruction, notice, checklist, or form",
   "start_node": "node_1",
   "nodes": {
     "node_1": {
       "type": "question",
       "response_type": "choice",
-      "question": "Clear question derived directly from the document text?",
-      "choices": ["Choice 1", "Choice 2", "Choice 3"],
-      "source_excerpt": "Exact rule quote or context from document",
-      "targets": {
-        "Choice 1": "node_2",
-        "Choice 2": "node_3",
-        "Choice 3": "node_4"
-      },
-      "action_items": ["Required compliance action for this step"]
+      "question": "A specific plain-language question grounded in the document",
+      "choices": ["Yes", "No"],
+      "source_excerpt": "Exact excerpt from the document",
+      "targets": {"Yes": "node_2", "No": "node_2"},
+      "action_items": []
     },
     "node_2": {
       "type": "question",
       "response_type": "text",
-      "question": "Question corresponding to a blank fill-in form field in the text?",
-      "source_excerpt": "Exact rule quote or form blank context",
-      "next_target": "node_5",
-      "action_items": ["Action item required for this form entry"]
+      "question": "An actual form field question supported by the document",
+      "source_excerpt": "Exact excerpt from the document",
+      "next_target": "",
+      "action_items": []
     }
   }
 }
-Return ONLY valid JSON. No markdown code blocks, no extra text.
+
+The last node must point to an empty string ("node_2" for choice targets, or "next_target": "" for text). Ensure all non-empty target IDs exist in nodes. Return at most 20 relevant questions. Prioritize accuracy and clear source grounding over quantity.
+
+DOCUMENT TEXT:
+{pdf_text}

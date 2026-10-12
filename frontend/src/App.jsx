@@ -1,469 +1,468 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
-import { Search, HelpCircle, Download, RotateCcw, ZoomIn, ZoomOut, X } from 'lucide-react';
+import {
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  CircleHelp,
+  Clock3,
+  Download,
+  FileText,
+  FileUp,
+  Info,
+  LoaderCircle,
+  LockKeyhole,
+  RotateCcw,
+  Sparkles,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const MAX_FILE_SIZE = 15 * 1024 * 1024;
+// 100% is the default. 200% is twice the default size; 300% is three times.
+const READING_SCALES = { normal: 1, large: 2, xlarge: 3 };
+
+function formatBytes(bytes) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function App() {
   const [file, setFile] = useState(null);
-  const [pdfUrl, setPdfUrl] = useState(null);
+  const [pdfUrl, setPdfUrl] = useState('');
   const [treeData, setTreeData] = useState(null);
   const [answers, setAnswers] = useState({});
   const [loading, setLoading] = useState(false);
-  const [highlightedNode, setHighlightedNode] = useState(null);
-  const [showModal, setShowModal] = useState(false);
-  const [textInputs, setTextInputs] = useState({});
-
-  // Resizable split state & Zoom state (starts at 100%)
-  const [leftWidth, setLeftWidth] = useState(50); // percentage
-  const [isResizing, setIsResizing] = useState(false);
-  const [hasResized, setHasResized] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState('');
+  const [showSource, setShowSource] = useState(true);
+  const [leftPanelPercent, setLeftPanelPercent] = useState(48);
+  const [isResizingPanels, setIsResizingPanels] = useState(false);
+  const workspaceRef = useRef(null);
+  const resizingPanelsRef = useRef(false);
   const [zoomLevel, setZoomLevel] = useState(100);
+  const [textSize, setTextSize] = useState('normal');
+  const [showHelp, setShowHelp] = useState(false);
+  const fileInputRef = useRef(null);
 
-  const containerRef = useRef(null);
+  useEffect(() => {
+    if (!file) {
+      setPdfUrl('');
+      return undefined;
+    }
+    const url = URL.createObjectURL(file);
+    setPdfUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
 
-  const handleFileChange = (e) => {
-    const uploadedFiles = e.target.files;
-    if (uploadedFiles && uploadedFiles.length > 0) {
-      setFile(uploadedFiles[0]);
-      setPdfUrl(URL.createObjectURL(uploadedFiles[0]));
-      setZoomLevel(100);
+  // Render every returned question together. Do not walk start_node/targets in
+  // the UI: sequential navigation hides later questions and makes the review
+  // feel complete before users can see the entire questionnaire.
+  const questions = useMemo(() => {
+    const nodes = treeData?.nodes;
+    if (!nodes || typeof nodes !== 'object') return [];
+    return Object.entries(nodes).map(([id, node]) => ({ id, ...node }));
+  }, [treeData]);
+  const answeredCount = questions.filter((node) => String(answers[node.id] ?? '').trim().length > 0).length;
+  const allAnswered = questions.length > 0 && answeredCount === questions.length;
+  const actionItems = useMemo(() => {
+    const all = [];
+    questions.forEach((node) => {
+      if (String(answers[node.id] ?? '').trim() && Array.isArray(node.action_items)) all.push(...node.action_items);
+    });
+    return [...new Set(all)];
+  }, [questions, answers]);
+
+  const updateAnswer = (nodeId, value) => {
+    setAnswers((existing) => ({ ...existing, [nodeId]: value }));
+    setError('');
+  };
+
+  const selectFile = (candidate) => {
+    setError('');
+    if (!candidate) return;
+    const lowerName = candidate.name.toLowerCase();
+    if (!lowerName.endsWith('.pdf') && !lowerName.endsWith('.docx')) {
+      setError('Choose a PDF or DOCX document. Other file types are not supported yet.');
+      return;
+    }
+    if (candidate.size > MAX_FILE_SIZE) {
+      setError('This file is larger than 15 MB. Choose a smaller document for this prototype.');
+      return;
+    }
+    setFile(candidate);
+    setTreeData(null);
+    setAnswers({});
+    setZoomLevel(100);
+  };
+
+  const handleFileInput = (event) => {
+    selectFile(event.target.files?.[0]);
+    // Allow selecting the same file again after an error or reset.
+    event.target.value = '';
+  };
+
+  const handleDrop = (event) => {
+    event.preventDefault();
+    selectFile(event.dataTransfer.files?.[0]);
+  };
+
+  const startPanelResize = (event) => {
+    if (window.innerWidth <= 850) return;
+    event.preventDefault();
+    resizingPanelsRef.current = true;
+    setIsResizingPanels(true);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const movePanelDivider = (event) => {
+    if (!resizingPanelsRef.current || !workspaceRef.current) return;
+    const bounds = workspaceRef.current.getBoundingClientRect();
+    const styles = window.getComputedStyle(workspaceRef.current);
+    const paddingLeft = Number.parseFloat(styles.paddingLeft) || 0;
+    const paddingRight = Number.parseFloat(styles.paddingRight) || 0;
+    // Two 16px gaps and the 8px divider use 40px of the content width.
+    const usableWidth = Math.max(1, bounds.width - paddingLeft - paddingRight - 40);
+    const contentLeft = bounds.left + paddingLeft;
+    const ratio = ((event.clientX - contentLeft - 20) / usableWidth) * 100;
+    setLeftPanelPercent(Math.min(62, Math.max(38, ratio)));
+  };
+
+  const finishPanelResize = () => {
+    resizingPanelsRef.current = false;
+    setIsResizingPanels(false);
+  };
+
+  const resizePanelsWithKeyboard = (event) => {
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      const delta = event.key === 'ArrowLeft' ? -3 : 3;
+      setLeftPanelPercent((value) => Math.min(62, Math.max(38, value + delta)));
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      setLeftPanelPercent(38);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      setLeftPanelPercent(62);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      setLeftPanelPercent(48);
     }
   };
 
-  const handleUpload = async () => {
-    if (!file) return;
+  const analyzeDocument = async () => {
+    if (!file) {
+      fileInputRef.current?.click();
+      return;
+    }
     setLoading(true);
+    setError('');
     const formData = new FormData();
-    formData.append("files", file);
-
+    formData.append('files', file);
     try {
-      const res = await axios.post("http://localhost:8000/parse-pdf", formData);
-      setTreeData(res.data);
+      const response = await axios.post(`${API_BASE_URL}/parse-pdf`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 150000,
+      });
+      setTreeData(response.data);
       setAnswers({});
-      setTextInputs({});
+      if (!response.data?.nodes || !Object.keys(response.data.nodes).length) {
+        setError('We extracted the document text, but could not create guided questions. Check that your local AI service is running, or use the source preview to continue manually.');
+      }
     } catch (err) {
-      alert("Failed to parse PDF batch. Ensure backend is running.");
-      console.error(err);
+      const detail = err?.response?.data?.detail;
+      setError(typeof detail === 'string' ? detail : 'We could not read this document. Check that the FastAPI backend is running and try again.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleAnswer = (nodeId, answer) => {
-    setAnswers({ ...answers, [nodeId]: answer });
+  const resetAnswers = () => {
+    setAnswers({});
+    setError('');
   };
-
-  const handleTextInputSubmit = (nodeId, nextTarget) => {
-    const val = textInputs[nodeId];
-    if (!val || !val.trim()) return;
-    setAnswers({ ...answers, [nodeId]: val.trim() });
-  };
-
-  // Resizer mouse handlers
-  useEffect(() => {
-    const handleMouseMove = (e) => {
-      if (!isResizing) return;
-      const totalWidth = window.innerWidth;
-      const newLeftWidth = (e.clientX / totalWidth) * 100;
-      if (newLeftWidth > 20 && newLeftWidth < 80) {
-        setLeftWidth(newLeftWidth);
-        if (newLeftWidth !== 50) setHasResized(true);
-      }
-    };
-    const handleMouseUp = () => {
-      setIsResizing(false);
-    };
-    if (isResizing) {
-      window.addEventListener('mousemove', handleMouseMove);
-      window.addEventListener('mouseup', handleMouseUp);
-    }
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [isResizing]);
-
-  // Dynamic Tree Traversal supporting multi-choices & text inputs
-  const getActiveSequence = () => {
-    if (!treeData || !treeData.nodes || !treeData.start_node) return [];
-    const sequence = [];
-    let currentId = treeData.start_node;
-
-    while (currentId && treeData.nodes[currentId]) {
-      const node = treeData.nodes[currentId];
-      sequence.push({ id: currentId, ...node });
-
-      const ans = answers[currentId];
-      if (ans === undefined) break;
-
-      if (node.response_type === 'text') {
-        currentId = node.next_target;
-      } else if (node.targets && node.targets[ans]) {
-        currentId = node.targets[ans];
-      } else if (ans === 'Yes') {
-        currentId = node.yes_target;
-      } else if (ans === 'No') {
-        currentId = node.no_target;
-      } else {
-        break;
-      }
-    }
-    return sequence;
-  };
-
-  const activeSequence = getActiveSequence();
-
-  const lastActiveNode = activeSequence[activeSequence.length - 1];
-  const isBranchTerminal = lastActiveNode && answers[lastActiveNode.id] !== undefined && (
-    (lastActiveNode.response_type === 'choice' && lastActiveNode.targets && !lastActiveNode.targets[answers[lastActiveNode.id]]) ||
-    (lastActiveNode.response_type === 'text' && !lastActiveNode.next_target) ||
-    (answers[lastActiveNode.id] === 'Yes' && !lastActiveNode.yes_target) || 
-    (answers[lastActiveNode.id] === 'No' && !lastActiveNode.no_target)
-  );
-
-  const activeActionItems = [];
-  activeSequence.forEach(node => {
-    if (answers[node.id] && node.action_items) {
-      activeActionItems.push(...node.action_items);
-    }
-  });
 
   const downloadReport = async () => {
+    if (!treeData) return;
+    setDownloading(true);
+    setError('');
     try {
-      const res = await axios.post("http://localhost:8000/generate-filled-pdf", {
-        answers,
-        nodes: treeData?.nodes || {}
-      }, { responseType: 'blob' });
-
-      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const response = await axios.post(
+        `${API_BASE_URL}/generate-filled-pdf`,
+        { answers: Object.fromEntries(Object.entries(answers).filter(([, value]) => String(value ?? '').trim())), nodes: treeData.nodes || {}, document_title: treeData.document_title || file?.name || 'Document' },
+        { responseType: 'blob', timeout: 60000 },
+      );
+      const url = URL.createObjectURL(new Blob([response.data], { type: 'application/pdf' }));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', 'Master_Compliance_Report.pdf');
+      link.download = 'PaperTrace-review-report.pdf';
       document.body.appendChild(link);
       link.click();
       link.remove();
-    } catch (err) {
-      alert("Failed to download PDF report!");
+      URL.revokeObjectURL(url);
+    } catch {
+      setError('The report could not be generated. Check that the backend is running, then try again.');
+    } finally {
+      setDownloading(false);
     }
   };
 
+  const isDocx = Boolean(file?.name.toLowerCase().endsWith('.docx'));
+  const progressText = `${answeredCount} of ${questions.length} answered`;
+
   return (
-    <div className="h-screen bg-white text-black flex flex-col font-serif overflow-hidden">
-      {/* Top Navigation Bar with Uniform Thin Borders */}
-      <header className="border-b border-black px-6 py-3 grid grid-cols-3 items-center bg-white rounded-none shrink-0">
-        <div>
-          <h1 className="text-xl font-bold tracking-wide">PaperTrace</h1>
-        </div>
-        <div className="flex justify-center">
-          <button 
-            onClick={handleUpload} 
-            disabled={!file || loading} 
-            className="border border-black bg-white hover:bg-black hover:text-white px-6 py-1.5 text-sm font-semibold rounded-none transition"
-          >
-            {loading ? "Parsing PDF..." : "Start Parse"}
+    <div className={`app-shell text-${textSize}`} style={{ '--reading-scale': READING_SCALES[textSize] || 1 }}>
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label="PaperTrace home">
+          <span className="brand-mark" aria-hidden="true">PT</span>
+          <span>PaperTrace</span>
+        </a>
+        <div className="topbar-actions">
+          <button className="icon-button help-button" onClick={() => setShowHelp((value) => !value)} aria-label="About PaperTrace" title="About PaperTrace">
+            <CircleHelp size={18} />
           </button>
-        </div>
-        <div className="flex justify-end items-center space-x-2">
-          <label className="border border-black px-3 py-1.5 text-xs font-bold uppercase bg-white hover:bg-black hover:text-white cursor-pointer transition rounded-none">
-            Select file(s)
-            <input 
-              type="file" 
-              multiple
-              onChange={handleFileChange} 
-              className="hidden" 
-            />
-          </label>
-          <span className="text-xs truncate max-w-[150px]">
-            {file ? file.name : "No file chosen"}
-          </span>
+          {file && <button className="button button-primary button-small" onClick={() => fileInputRef.current?.click()}>
+            <FileUp size={16} /> <span>Change file</span>
+          </button>}
+          <input ref={fileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handleFileInput} aria-label="Choose a PDF or DOCX document" />
         </div>
       </header>
 
-      {/* Main Split Dashboard */}
-      <div className="flex-1 flex overflow-hidden relative min-h-0" ref={containerRef}>
-        
-        {/* Left Column: Questions List */}
-        <div 
-          className="p-6 overflow-y-auto space-y-6 bg-white h-full"
-          style={{ width: `${leftWidth}%` }}
-        >
-          {!treeData ? (
-            <div className="flex flex-col items-center justify-center h-full text-black space-y-3">
-              <p>Upload a compliance PDF and click "Start Parse" to begin review.</p>
-            </div>
-          ) : (
-            <>
-              <div className="border border-black p-4 rounded-none bg-white flex justify-between items-center">
-                <div>
-                  <span className="text-xs uppercase tracking-wider font-bold">Active Document</span>
-                  <h2 className="text-lg font-bold">{treeData.document_title}</h2>
-                </div>
-                <button 
-                  onClick={() => { setAnswers({}); setTextInputs({}); }} 
-                  className="border border-black px-3 py-1 text-xs font-bold hover:bg-black hover:text-white rounded-none flex items-center space-x-1 transition"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" /> <span>Reset</span>
-                </button>
-              </div>
-
-              {activeSequence.map((node, index) => {
-                const isAnswered = answers[node.id] !== undefined;
-                const choices = node.choices || (node.response_type === 'choice' ? Object.keys(node.targets || {}) : ['Yes', 'No']);
-
-                return (
-                  <div key={node.id} className="border border-black rounded-none p-5 bg-white space-y-3">
-                    <div className="flex justify-between items-start">
-                      <span className="text-xs font-bold tracking-wider flex items-center space-x-2">
-                        <span>ITEM #{index + 1}</span>
-                        {isAnswered && <span className="border border-black px-1.5 py-0.5 text-xs font-bold bg-black text-white">✓ Answered ({answers[node.id]})</span>}
-                      </span>
-                      
-                      <button 
-                        onClick={() => setHighlightedNode(node.id)}
-                        title="Locate source in PDF"
-                        className="border border-black p-1.5 bg-white hover:bg-black hover:text-white rounded-none flex items-center space-x-1 transition"
-                      >
-                        <Search className="w-4 h-4 inline" />
-                        <HelpCircle className="w-4 h-4 inline" />
-                      </button>
-                    </div>
-
-                    <p className="text-lg font-medium">{node.question}</p>
-
-                    <div className="border-l-2 border-black pl-4 py-1 text-sm italic">
-                      "{node.source_excerpt || node.question}"
-                    </div>
-
-                    {node.response_type === 'text' ? (
-                      <div className="space-y-3 pt-2">
-                        <input 
-                          type="text" 
-                          placeholder="Type your official response for form blank..."
-                          value={textInputs[node.id] !== undefined ? textInputs[node.id] : (answers[node.id] || '')}
-                          onChange={(e) => setTextInputs({ ...textInputs, [node.id]: e.target.value })}
-                          className="w-full border border-black p-2.5 text-sm rounded-none focus:outline-none bg-white"
-                        />
-                        <button
-                          onClick={() => handleTextInputSubmit(node.id, node.next_target)}
-                          className="border border-black bg-white hover:bg-black hover:text-white px-4 py-2 font-bold text-xs uppercase transition rounded-none"
-                        >
-                          Confirm Form Input
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="flex flex-wrap gap-2 pt-2">
-                        {choices.map((choice, cIdx) => (
-                          <button 
-                            key={cIdx}
-                            onClick={() => handleAnswer(node.id, choice)}
-                            className={`flex-1 min-w-[100px] border border-black py-2.5 px-3 font-bold rounded-none transition ${answers[node.id] === choice ? 'bg-black text-white' : 'bg-white hover:bg-black hover:text-white'}`}
-                          >
-                            {choice}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-
-              {isBranchTerminal && (
-                <div className="border border-black p-4 text-xs font-bold uppercase tracking-wider bg-white">
-                  ★ EVALUATION COMPLETE FOR THIS BRANCH.
-                </div>
-              )}
-
-              <div className="border border-black rounded-none p-6 space-y-4 bg-white mt-8">
-                <div className="text-base font-bold tracking-wide border-b border-black pb-2">RESULT</div>
-                
-                <div className="text-sm space-y-3">
-                  {Object.keys(answers).length > 0 ? (
-                    <>
-                      <p className="font-bold">Evaluated {Object.keys(answers).length} item(s) in active compliance path.</p>
-                      
-                      <div className="flex space-x-3">
-                        <button 
-                          onClick={() => setShowModal(true)}
-                          className="flex-1 border border-black bg-white hover:bg-black hover:text-white font-bold py-2 px-3 rounded-none text-xs uppercase tracking-wider transition"
-                        >
-                          View Detailed Explanation
-                        </button>
-                      </div>
-
-                      <div className="border border-black p-3 space-y-2 bg-white">
-                        <p className="font-bold text-xs uppercase tracking-wider">Required Compliance Actions & Explanations:</p>
-                        {activeActionItems.length > 0 ? (
-                          <ul className="list-disc pl-5 space-y-1">
-                            {Array.from(new Set(activeActionItems)).map((action, i) => (
-                              <li key={i}>{action}</li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <p className="italic">No further action required based on your current path selections.</p>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <p className="italic">Awaiting user decisions on active compliance checklist items above...</p>
-                  )}
-                </div>
-
-                <button 
-                  onClick={downloadReport}
-                  className="w-full border border-black bg-white hover:bg-black hover:text-white font-bold py-3 px-4 rounded-none flex items-center justify-center space-x-2 transition mt-4"
-                >
-                  <Download className="w-5 h-5" />
-                  <span>Download Report File</span>
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Resizable Divider Bar */}
-        <div 
-          onMouseDown={() => setIsResizing(true)}
-          className="w-4 bg-white cursor-col-resize z-10 relative select-none flex items-center justify-center shrink-0"
-          title="Drag to resize panels"
-        >
-          <div className="absolute inset-y-0 left-0 w-[1px] bg-black" />
-          <div className="absolute inset-y-0 right-0 w-[1px] bg-black" />
-          {isResizing && (
-            <div className="absolute inset-y-0 left-1/2 w-[1px] bg-black -translate-x-1/2" />
-          )}
-
-          {hasResized && (
-            <button 
-              onClick={(e) => { 
-                e.stopPropagation(); 
-                setLeftWidth(50); 
-                setHasResized(false); 
-              }}
-              className="absolute top-4 border border-black p-1 bg-white hover:bg-black hover:text-white rounded-none transition z-20"
-              title="Reset panel sizing (50/50)"
-            >
-              <RotateCcw className="w-3 h-3" />
-            </button>
-          )}
-        </div>
-
-        {/* Right Column: Interactive Live PDF Source Document Viewer */}
-        <div 
-          className="bg-white flex flex-col h-full relative overflow-hidden px-4 py-3 min-h-0"
-          style={{ width: `${100 - leftWidth}%` }}
-        >
-          <div className="flex justify-between items-center mb-2 shrink-0">
-            <span className="text-xs uppercase tracking-wider font-bold">LIVE PDF SOURCE DOCUMENT VIEWER</span>
-            <div className="flex items-center space-x-1">
-              <button 
-                onClick={() => setZoomLevel(prev => Math.max(50, prev - 15))}
-                className="border border-black p-1 bg-white hover:bg-black hover:text-white rounded-none"
-                title="Zoom Out"
-              >
-                <ZoomOut className="w-4 h-4" />
-              </button>
-              <span className="text-xs font-bold px-1">{zoomLevel}%</span>
-              <button 
-                onClick={() => setZoomLevel(prev => Math.min(250, prev + 15))}
-                className="border border-black p-1 bg-white hover:bg-black hover:text-white rounded-none"
-                title="Zoom In"
-              >
-                <ZoomIn className="w-4 h-4" />
-              </button>
-              <button 
-                onClick={() => setZoomLevel(100)}
-                className="border border-black px-2 py-0.5 text-xs font-bold hover:bg-black hover:text-white rounded-none ml-1"
-              >
-                Reset
-              </button>
-            </div>
-          </div>
-          
-          {/* Iframe container */}
-          <div className="flex-1 bg-white rounded-none border border-black relative overflow-hidden flex flex-col min-h-0">
-            {pdfUrl ? (
-              <div className="relative w-full h-full flex-1 min-h-0">
-                <iframe 
-                  key={zoomLevel}
-                  src={`${pdfUrl}#zoom=${zoomLevel}&toolbar=0`}
-                  className="w-full h-full border-0 absolute inset-0"
-                  title="PDF Preview" 
-                />
-
-                {/* Dismissible Highlight Box / Notice Banner */}
-                {highlightedNode && (
-                  <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black text-white px-4 py-2 text-xs font-bold flex items-center space-x-3 shadow-lg z-30 rounded-none border border-black">
-                    <span>⚡ Source Excerpt Highlight Active for Item</span>
-                    <button 
-                      onClick={() => setHighlightedNode(null)}
-                      className="border border-white p-0.5 hover:bg-white hover:text-black transition"
-                      title="Dismiss Highlight"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                )}
-
-                {highlightedNode && (
-                  <div className="absolute top-20 left-1/2 -translate-x-1/2 w-3/4 h-24 border-2 border-orange-500 bg-orange-100/30 pointer-events-none z-20" />
-                )}
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center h-full space-y-2">
-                <p className="text-sm">No PDF loaded for preview</p>
-              </div>
-            )}
-          </div>
-        </div>
-
-      </div>
-
-      {/* Enlarged Brutalist Pop-up Modal */}
-      {showModal && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-6">
-          <div className="bg-white border-2 border-black p-8 w-full max-w-4xl max-h-[90vh] overflow-y-auto space-y-6 rounded-none shadow-2xl">
-            <div className="flex justify-between items-center border-b-2 border-black pb-4">
-              <h3 className="text-lg font-bold tracking-wide uppercase">Compliance Evaluation Detailed Breakdown</h3>
-              <button 
-                onClick={() => setShowModal(false)}
-                className="border border-black px-4 py-1.5 text-sm font-bold hover:bg-black hover:text-white rounded-none transition"
-              >
-                [CLOSE]
-              </button>
-            </div>
-
-            <div className="space-y-6 text-base">
-              <div>
-                <span className="text-sm uppercase font-bold text-gray-700">Document Source:</span>
-                <p className="font-bold text-lg mt-0.5">{treeData?.document_title}</p>
-              </div>
-
-              <div className="border-2 border-black p-6 space-y-6 bg-gray-50/50">
-                <p className="font-bold text-sm uppercase tracking-wider text-black">
-                  Traversed Path Summary ({activeSequence.length} Questions):
-                </p>
-                {activeSequence.map((node, i) => (
-                  <div key={node.id} className="border-b-2 border-black/30 pb-6 last:border-0 last:pb-0 space-y-3">
-                    <p className="text-base font-medium"><b>Question {i + 1}:</b> {node.question}</p>
-                    <p className="text-sm italic text-gray-800">Source Excerpt: "{node.source_excerpt}"</p>
-                    <p className="text-base"><b>User Decision:</b> <span className="underline font-bold text-lg">{answers[node.id]}</span></p>
-
-                    {node.action_items && node.action_items.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-black/30">
-                        <p className="font-bold text-sm uppercase tracking-wider">Required Action Item(s):</p>
-                        <ul className="list-disc pl-6 text-sm space-y-2 mt-1">
-                          {node.action_items.map((action, actIdx) => (
-                            <li key={actIdx} className="text-base">{action}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
+      {showHelp && (
+        <div className="help-popover" role="status">
+          <strong>About PaperTrace</strong>
+          <p>AI suggests questions. Check the original before acting.</p>
+          <button className="text-button" onClick={() => setShowHelp(false)}>Close</button>
         </div>
       )}
+
+      <main
+        id="top"
+        ref={workspaceRef}
+        className={`workspace ${showSource ? '' : 'source-hidden'} ${isResizingPanels ? 'is-resizing-panels' : ''}`}
+        style={showSource ? { gridTemplateColumns: `minmax(0, ${leftPanelPercent}fr) 8px minmax(0, ${100 - leftPanelPercent}fr)` } : undefined}
+      >
+        <section className="work-column" aria-label="Guided document review">
+          <div className="page-heading">
+            <div>
+              <h1>Read the requirement.<br />Keep your footing.</h1>
+              <p className="page-subtitle">All questions in one list. Source stays visible.</p>
+            </div>
+            {treeData && <div className="saved-pill"><span className="saved-dot" /> {progressText}</div>}
+          </div>
+
+          {!file ? (
+            <div
+              className="upload-card"
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={handleDrop}
+            >
+              <div className="upload-illustration"><FileUp size={29} strokeWidth={1.7} /></div>
+              <h2>Bring the document into focus.</h2>
+              <button className="button button-primary" onClick={() => fileInputRef.current?.click()}><FileUp size={17} /> Choose a document</button>
+              <div className="upload-or"><span /> or drop the file on this page <span /></div>
+              <div className="file-support"><span><Check size={14} /> PDF</span><span><Check size={14} /> DOCX</span><span>Up to 15 MB</span></div>
+              <div className="privacy-note"><LockKeyhole size={15} /> Sensitive file? Upload with care.</div>
+            </div>
+          ) : (
+            <div className="document-card">
+              <div className="file-icon"><FileText size={22} /></div>
+              <div className="document-meta">
+                <strong title={file.name}>{file.name}</strong>
+                <span>{isDocx ? 'Word document' : 'PDF document'} · {formatBytes(file.size)}</span>
+              </div>
+              {treeData && <span className="file-status"><CheckCircle2 size={15} /> Loaded</span>}
+              {!treeData && <span className="file-status file-status-muted"><Clock3 size={15} /> Ready to review</span>}
+              <button className="icon-button" onClick={() => { setFile(null); setTreeData(null); setAnswers({}); setError(''); }} aria-label="Remove selected document" title="Remove document"><RotateCcw size={16} /></button>
+            </div>
+          )}
+
+          {file && !treeData && (
+            <div className="analyze-panel">
+              <div className="analyze-copy">
+                <Sparkles size={18} />
+                <div><strong>AI-guided review</strong><span>Check each suggestion against the source.</span></div>
+              </div>
+              <button className="button button-primary" onClick={analyzeDocument} disabled={loading}>
+                {loading ? <><LoaderCircle className="spin" size={17} /> Reading document…</> : <><Sparkles size={16} /> Start guided review <ArrowRight size={16} /></>}
+              </button>
+            </div>
+          )}
+
+          {error && <div className="alert alert-error" role="alert"><Info size={18} /><span>{error}</span><button className="alert-dismiss" aria-label="Dismiss message" onClick={() => setError('')}>×</button></div>}
+
+          {treeData?.generation_notice && ['review_fallback', 'ai_partial'].includes(treeData.question_generation_mode) && (
+            <div className="alert alert-warning" role="status">
+              <Info size={18} />
+              <span>
+                <strong>{treeData.question_generation_mode === 'ai_partial' ? 'Partial AI review.' : 'Manual review mode.'}</strong>{' '}
+                {treeData.generation_notice}
+              </span>
+            </div>
+          )}
+          {treeData?.text_truncated && (
+            <div className="alert alert-warning" role="status">
+              <Info size={18} />
+              <span>This document is longer than the current prototype can send to the AI at once. The questionnaire may not cover every section; check the entire original document.</span>
+            </div>
+          )}
+
+          {treeData && questions.length > 0 && (
+            <>
+              <div className="section-heading question-list-heading">
+                <div>
+                  <h2>Questions</h2>
+                  <p className="section-caption">Answer what you can. Change answers anytime.</p>
+                </div>
+                <div className="question-heading-actions">
+                  <span className="question-progress" aria-live="polite">{progressText}</span>
+                  <button className="text-button reset-link" onClick={resetAnswers}><RotateCcw size={14} /> Clear answers</button>
+                </div>
+              </div>
+
+              <form className="question-list" aria-label="Document questions" onSubmit={(event) => event.preventDefault()}>
+                {questions.map((node, index) => {
+                  const value = answers[node.id] ?? '';
+                  const isAnswered = String(value).trim().length > 0;
+                  const choices = node.choices || (node.targets ? Object.keys(node.targets) : ['Yes', 'No']);
+                  const questionId = `question-${node.id}`;
+                  const answerId = `answer-${node.id}`;
+                  return (
+                    <article className={`question-card question-list-item ${isAnswered ? 'is-answered' : 'is-unanswered'}`} key={node.id} aria-labelledby={questionId}>
+                      <div className="question-card-top">
+                        <span className="step-chip">QUESTION {String(index + 1).padStart(2, '0')}</span>
+                        <span className={`question-status ${isAnswered ? 'status-answered' : 'status-unanswered'}`}>
+                          {isAnswered ? <><Check size={13} /> Answered</> : 'Not answered'}
+                        </span>
+                      </div>
+                      <h3 id={questionId}>{node.question || `Review question ${index + 1}`}</h3>
+                      {node.source_excerpt && (
+                        <details className="source-quote">
+                          <summary><span><FileText size={15} /> View source wording</span><ChevronDown size={16} /></summary>
+                          <blockquote>{node.source_excerpt}</blockquote>
+                        </details>
+                      )}
+                      {node.response_type === 'text' ? (
+                        <div className="answer-field">
+                          <label htmlFor={answerId}>Your answer</label>
+                          <textarea
+                            id={answerId}
+                            rows={2}
+                            value={value}
+                            onChange={(event) => updateAnswer(node.id, event.target.value)}
+                            placeholder="Type your answer…"
+                          />
+                        </div>
+                      ) : (
+                        <fieldset className="choice-group">
+                          <legend>Choose one</legend>
+                          {choices.map((choice) => (
+                            <label key={choice} className={`choice-option ${value === choice ? 'is-selected' : ''}`}>
+                              <input
+                                type="radio"
+                                name={`answer-${node.id}`}
+                                value={choice}
+                                checked={value === choice}
+                                onChange={() => updateAnswer(node.id, choice)}
+                              />
+                              <span className="choice-indicator">{value === choice && <Check size={14} />}</span>
+                              <span className="choice-label">{choice}</span>
+                            </label>
+                          ))}
+                        </fieldset>
+                      )}
+                    </article>
+                  );
+                })}
+              </form>
+
+              <section className="answer-review" aria-labelledby="report-title">
+                <div className="answer-review-heading">
+                  <div><h3 id="report-title">Review report</h3></div>
+                  <span>{progressText}</span>
+                </div>
+                {allAnswered ? (
+                  <div className="completion-notice" role="status"><CheckCircle2 size={18} /> All listed questions answered. Check the original before export.</div>
+                ) : (
+                  <p className="answer-review-intro">Unanswered questions stay visible above.</p>
+                )}
+                {actionItems.length > 0 && (
+                  <div className="action-box"><div className="action-box-title"><Info size={16} /><strong>Suggested actions</strong></div><ul>{actionItems.map((action, index) => <li key={`${index}-${action}`}>{action}</li>)}</ul></div>
+                )}
+                <div className="report-row">
+                  <div><span>{progressText} · Original unchanged.</span></div>
+                  <button className="button button-primary report-download-button" onClick={downloadReport} disabled={answeredCount === 0 || downloading}>
+                    {downloading ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
+                    {downloading ? 'Preparing report…' : 'Download review report'}
+                  </button>
+                </div>
+              </section>
+            </>
+          )}
+
+          {treeData && questions.length === 0 && (
+            <div className="empty-state-panel"><CircleHelp size={25} /><h2>No guided questions yet</h2><p>The document text may still be available in the source panel. Check the local AI service and try parsing again.</p><button className="button button-secondary" onClick={analyzeDocument} disabled={loading}>Try again</button></div>
+          )}
+
+          <footer className="work-footer"><span>Prototype · Verify against the original.</span><button className="text-button" onClick={() => setShowSource((value) => !value)}>{showSource ? 'Hide source' : 'Show source'}</button></footer>
+        </section>
+
+        {showSource && (
+          <div
+            className="panel-divider"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize review and source panels"
+            aria-valuemin={38}
+            aria-valuemax={62}
+            aria-valuenow={leftPanelPercent}
+            aria-valuetext={`Review panel ${leftPanelPercent} percent; source panel ${100 - leftPanelPercent} percent`}
+            tabIndex={0}
+            onPointerDown={startPanelResize}
+            onPointerMove={movePanelDivider}
+            onPointerUp={finishPanelResize}
+            onPointerCancel={finishPanelResize}
+            onLostPointerCapture={finishPanelResize}
+            onKeyDown={resizePanelsWithKeyboard}
+            onDoubleClick={() => setLeftPanelPercent(48)}
+            title="Drag to resize. Use arrow keys to adjust; press Enter to reset."
+          >
+            <span aria-hidden="true" />
+          </div>
+        )}
+
+        {showSource && (
+          <aside className="source-column" aria-label="Original document preview">
+            <div className="source-header">
+              <div><h2>Original document</h2></div>
+              {file && !isDocx && <div className="zoom-controls"><button className="icon-button" onClick={() => setZoomLevel((value) => Math.max(50, value - 10))} title="Zoom out" aria-label="Zoom out"><ZoomOut size={16} /></button><span>{zoomLevel}%</span><button className="icon-button" onClick={() => setZoomLevel((value) => Math.min(200, value + 10))} title="Zoom in" aria-label="Zoom in"><ZoomIn size={16} /></button></div>}
+            </div>
+            <div className="source-file-label">{file ? <><FileText size={15} /><span title={file.name}>{file.name}</span></> : <><FileText size={15} /><span>Preview will appear here</span></>}</div>
+            <div className="source-viewer">
+              {!file ? (
+                <div className="source-empty"><div><FileText size={28} /><span>Your document appears here.</span><small>PDF or DOCX</small></div></div>
+              ) : isDocx ? (
+                <div className="docx-preview">
+                  <div className="docx-page-label">DOCUMENT TEXT</div>
+                  {treeData?.text_preview ? <pre>{treeData.text_preview}</pre> : <div className="preview-prompt">Start the guided review to extract the text from this Word document.</div>}
+                </div>
+              ) : (
+                <iframe key={`${pdfUrl}-${zoomLevel}`} title="Original PDF document preview" src={`${pdfUrl}#toolbar=0&navpanes=0&zoom=${zoomLevel}`} />
+              )}
+            </div>
+            <div className="source-footer"><LockKeyhole size={13} /><span>Original unchanged · Export is separate.</span></div>
+          </aside>
+        )}
+      </main>
+
+      <div className="accessibility-toolbar" role="group" aria-label="Interface text size">
+        <span>Text size</span>
+        <button className={textSize === 'normal' ? 'active' : ''} onClick={() => setTextSize('normal')} aria-label="Text size 100 percent (default)" title="Text size 100 percent (default)" aria-pressed={textSize === 'normal'}>100%</button>
+        <button className={textSize === 'large' ? 'active' : ''} onClick={() => setTextSize('large')} aria-label="Text size 200 percent (twice the default size)" title="Text size 200 percent (twice the default size)" aria-pressed={textSize === 'large'}>200%</button>
+        <button className={textSize === 'xlarge' ? 'active' : ''} onClick={() => setTextSize('xlarge')} aria-label="Text size 300 percent (three times the default size)" title="Text size 300 percent (three times the default size)" aria-pressed={textSize === 'xlarge'}>300%</button>
+      </div>
     </div>
   );
 }
