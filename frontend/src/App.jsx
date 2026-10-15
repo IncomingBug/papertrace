@@ -1,468 +1,658 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import axios from 'axios';
 import {
-  ArrowRight,
-  Check,
-  CheckCircle2,
-  ChevronDown,
-  CircleHelp,
-  Clock3,
   Download,
-  FileText,
-  FileUp,
-  Info,
-  LoaderCircle,
-  LockKeyhole,
   RotateCcw,
-  Sparkles,
   ZoomIn,
   ZoomOut,
+  FileText,
+  CheckCircle2,
+  AlertCircle,
+  X,
+  Eye,
 } from 'lucide-react';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const MAX_FILE_SIZE = 15 * 1024 * 1024;
-// 100% is the default. 200% is twice the default size; 300% is three times.
-const READING_SCALES = { normal: 1, large: 2, xlarge: 3 };
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-function formatBytes(bytes) {
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+function sortNodeEntries(nodes) {
+  return Object.entries(nodes || {})
+    .filter(([, node]) => node && (node.question || node.type === 'question'))
+    .sort(([a], [b]) => {
+      const ai = Number((a.match(/\d+/) || [Number.MAX_SAFE_INTEGER])[0]);
+      const bi = Number((b.match(/\d+/) || [Number.MAX_SAFE_INTEGER])[0]);
+      return ai - bi;
+    })
+    .map(([id, node], index) => ({ id, ...node, __index: index }));
 }
 
-export default function App() {
-  const [file, setFile] = useState(null);
-  const [pdfUrl, setPdfUrl] = useState('');
-  const [treeData, setTreeData] = useState(null);
-  const [answers, setAnswers] = useState({});
-  const [loading, setLoading] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [error, setError] = useState('');
-  const [showSource, setShowSource] = useState(true);
-  const [leftPanelPercent, setLeftPanelPercent] = useState(48);
-  const [isResizingPanels, setIsResizingPanels] = useState(false);
-  const workspaceRef = useRef(null);
-  const resizingPanelsRef = useRef(false);
-  const [zoomLevel, setZoomLevel] = useState(100);
-  const [textSize, setTextSize] = useState('normal');
-  const [showHelp, setShowHelp] = useState(false);
-  const fileInputRef = useRef(null);
-
-  useEffect(() => {
-    if (!file) {
-      setPdfUrl('');
-      return undefined;
-    }
-    const url = URL.createObjectURL(file);
-    setPdfUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
-
-  // Render every returned question together. Do not walk start_node/targets in
-  // the UI: sequential navigation hides later questions and makes the review
-  // feel complete before users can see the entire questionnaire.
-  const questions = useMemo(() => {
-    const nodes = treeData?.nodes;
-    if (!nodes || typeof nodes !== 'object') return [];
-    return Object.entries(nodes).map(([id, node]) => ({ id, ...node }));
-  }, [treeData]);
-  const answeredCount = questions.filter((node) => String(answers[node.id] ?? '').trim().length > 0).length;
-  const allAnswered = questions.length > 0 && answeredCount === questions.length;
-  const actionItems = useMemo(() => {
-    const all = [];
-    questions.forEach((node) => {
-      if (String(answers[node.id] ?? '').trim() && Array.isArray(node.action_items)) all.push(...node.action_items);
+function getNodeActions(node, answer) {
+  if (answer === undefined || answer === null || answer === '') return [];
+  const uniqueActions = (items) => {
+    if (!Array.isArray(items)) return [];
+    const seen = new Set();
+    return items.filter((item) => {
+      if (typeof item !== 'string' || !item.trim()) return false;
+      const key = item.trim().replace(/\s+/g, ' ').replace(/[.!?;:]+$/, '').toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
-    return [...new Set(all)];
-  }, [questions, answers]);
-
-  const updateAnswer = (nodeId, value) => {
-    setAnswers((existing) => ({ ...existing, [nodeId]: value }));
-    setError('');
   };
+  const byAnswer = node.actions_by_answer ?? node.action_items_by_answer;
+  if (byAnswer && typeof byAnswer === 'object' && !Array.isArray(byAnswer)) {
+    return uniqueActions(byAnswer[String(answer)]);
+  }
+  if (node.response_type === 'choice' && Array.isArray(node.choices) && node.choices.includes('Yes') && node.choices.includes('No')) {
+    return [];
+  }
+  return uniqueActions(node.action_items);
+}
 
-  const selectFile = (candidate) => {
-    setError('');
-    if (!candidate) return;
-    const lowerName = candidate.name.toLowerCase();
-    if (!lowerName.endsWith('.pdf') && !lowerName.endsWith('.docx')) {
-      setError('Choose a PDF or DOCX document. Other file types are not supported yet.');
-      return;
-    }
-    if (candidate.size > MAX_FILE_SIZE) {
-      setError('This file is larger than 15 MB. Choose a smaller document for this prototype.');
-      return;
-    }
-    setFile(candidate);
-    setTreeData(null);
-    setAnswers({});
-    setZoomLevel(100);
-  };
+function dependencyState(node, answers) {
+  const raw = node.depends_on ?? node.dependsOn ?? node.dependency;
+  if (!raw) return { state: 'ready', reason: '' };
 
-  const handleFileInput = (event) => {
-    selectFile(event.target.files?.[0]);
-    // Allow selecting the same file again after an error or reset.
-    event.target.value = '';
-  };
-
-  const handleDrop = (event) => {
-    event.preventDefault();
-    selectFile(event.dataTransfer.files?.[0]);
-  };
-
-  const startPanelResize = (event) => {
-    if (window.innerWidth <= 850) return;
-    event.preventDefault();
-    resizingPanelsRef.current = true;
-    setIsResizingPanels(true);
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-  };
-
-  const movePanelDivider = (event) => {
-    if (!resizingPanelsRef.current || !workspaceRef.current) return;
-    const bounds = workspaceRef.current.getBoundingClientRect();
-    const styles = window.getComputedStyle(workspaceRef.current);
-    const paddingLeft = Number.parseFloat(styles.paddingLeft) || 0;
-    const paddingRight = Number.parseFloat(styles.paddingRight) || 0;
-    // Two 16px gaps and the 8px divider use 40px of the content width.
-    const usableWidth = Math.max(1, bounds.width - paddingLeft - paddingRight - 40);
-    const contentLeft = bounds.left + paddingLeft;
-    const ratio = ((event.clientX - contentLeft - 20) / usableWidth) * 100;
-    setLeftPanelPercent(Math.min(62, Math.max(38, ratio)));
-  };
-
-  const finishPanelResize = () => {
-    resizingPanelsRef.current = false;
-    setIsResizingPanels(false);
-  };
-
-  const resizePanelsWithKeyboard = (event) => {
-    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-      event.preventDefault();
-      const delta = event.key === 'ArrowLeft' ? -3 : 3;
-      setLeftPanelPercent((value) => Math.min(62, Math.max(38, value + delta)));
-    } else if (event.key === 'Home') {
-      event.preventDefault();
-      setLeftPanelPercent(38);
-    } else if (event.key === 'End') {
-      event.preventDefault();
-      setLeftPanelPercent(62);
-    } else if (event.key === 'Enter') {
-      event.preventDefault();
-      setLeftPanelPercent(48);
-    }
-  };
-
-  const analyzeDocument = async () => {
-    if (!file) {
-      fileInputRef.current?.click();
-      return;
-    }
-    setLoading(true);
-    setError('');
-    const formData = new FormData();
-    formData.append('files', file);
-    try {
-      const response = await axios.post(`${API_BASE_URL}/parse-pdf`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 150000,
-      });
-      setTreeData(response.data);
-      setAnswers({});
-      if (!response.data?.nodes || !Object.keys(response.data.nodes).length) {
-        setError('We extracted the document text, but could not create guided questions. Check that your local AI service is running, or use the source preview to continue manually.');
+  const dependencies = Array.isArray(raw) ? raw : [raw];
+  for (const dep of dependencies) {
+    if (typeof dep === 'string') {
+      if (answers[dep] === undefined) {
+        return { state: 'waiting', reason: 'Answer the linked question first.' };
       }
-    } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setError(typeof detail === 'string' ? detail : 'We could not read this document. Check that the FastAPI backend is running and try again.');
-    } finally {
-      setLoading(false);
+      continue;
     }
-  };
+    if (!dep || typeof dep !== 'object') continue;
 
-  const resetAnswers = () => {
-    setAnswers({});
-    setError('');
-  };
-
-  const downloadReport = async () => {
-    if (!treeData) return;
-    setDownloading(true);
-    setError('');
-    try {
-      const response = await axios.post(
-        `${API_BASE_URL}/generate-filled-pdf`,
-        { answers: Object.fromEntries(Object.entries(answers).filter(([, value]) => String(value ?? '').trim())), nodes: treeData.nodes || {}, document_title: treeData.document_title || file?.name || 'Document' },
-        { responseType: 'blob', timeout: 60000 },
-      );
-      const url = URL.createObjectURL(new Blob([response.data], { type: 'application/pdf' }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'PaperTrace-review-report.pdf';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-    } catch {
-      setError('The report could not be generated. Check that the backend is running, then try again.');
-    } finally {
-      setDownloading(false);
+    const parentId = dep.node_id || dep.question_id || dep.id || dep.question;
+    if (!parentId) continue;
+    if (answers[parentId] === undefined) {
+      return { state: 'waiting', reason: 'Answer the linked question first.' };
     }
-  };
 
-  const isDocx = Boolean(file?.name.toLowerCase().endsWith('.docx'));
-  const progressText = `${answeredCount} of ${questions.length} answered`;
+    const expected = dep.answer ?? dep.expected_answer ?? dep.value;
+    if (expected !== undefined && String(answers[parentId]) !== String(expected)) {
+      return { state: 'not-applicable', reason: 'This follow-up does not apply to your answer.' };
+    }
+  }
+  return { state: 'ready', reason: '' };
+}
+
+/* =========================================================================
+   Sub-components
+   ========================================================================= */
+
+const Header = React.memo(function Header({ textScale, setTextScale }) {
+  return (
+    <header className="pt-header">
+      <div className="pt-brand">PaperTrace</div>
+      <div className="pt-header-note">
+        <span className="pt-header-spark" aria-hidden="true" />
+        <div className="pt-accessibility" role="group" aria-label="Text size">
+          <span>Text size</span>
+          {[100, 200, 300].map((scale) => (
+            <button
+              key={scale}
+              type="button"
+              className={textScale === scale ? 'is-active' : ''}
+              aria-pressed={textScale === scale}
+              aria-label={`${scale}% text size`}
+              onClick={() => setTextScale(scale)}
+            >
+              {scale}%
+            </button>
+          ))}
+        </div>
+      </div>
+    </header>
+  );
+});
+
+const UploadSection = React.memo(function UploadSection({
+  file,
+  loading,
+  dragActive,
+  setDragActive,
+  fileInputRef,
+  chooseFile,
+  handleFileChange,
+  handleUpload,
+}) {
+  return (
+    <div
+      className={`pt-upload-area ${dragActive ? 'pt-intro--dragging' : ''}`}
+      onDragOver={(event) => { event.preventDefault(); setDragActive(true); }}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={(event) => {
+        event.preventDefault();
+        setDragActive(false);
+        chooseFile(event.dataTransfer.files?.[0]);
+      }}
+    >
+      <h2>Bring the document into focus.</h2>
+      <p className="pt-upload-description">Choose a PDF or DOCX to build a source-linked review.</p>
+
+      <input
+        ref={fileInputRef}
+        className="pt-file-input"
+        type="file"
+        accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        onChange={handleFileChange}
+        aria-label="Choose a PDF or DOCX document"
+      />
+
+      <div className="pt-upload-actions">
+        <button
+          className="pt-glass-button"
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <span className="pt-button-spark" aria-hidden="true">→</span>
+          <span>{file ? 'Change document' : 'Choose a document'}</span>
+          <span className="pt-button-arrow" aria-hidden="true">←</span>
+        </button>
+        {file && (
+          <button
+            className="pt-soft-button pt-parse-button"
+            type="button"
+            onClick={handleUpload}
+            disabled={loading}
+          >
+            {loading ? <span className="pt-spinner" aria-hidden="true" /> : <FileText size={16} />}
+            {loading ? 'Reading…' : 'Start review'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+});
+
+// Memoized Question Card to prevent unnecessary re-renders when typing in other inputs
+const QuestionCard = React.memo(function QuestionCard({
+  node,
+  index,
+  answer,
+  textInputVal,
+  onTextChange,
+  onTextSubmit,
+  onAnswer,
+  answers,
+}) {
+  const isAnswered = answer !== undefined && answer !== null && String(answer).trim() !== '';
+  const applicability = dependencyState(node, answers);
+  const choices = Array.isArray(node.choices) && node.choices.length
+    ? node.choices
+    : (node.response_type === 'choice' ? Object.keys(node.targets || {}) : ['Yes', 'No']);
+  const nodeActions = getNodeActions(node, answer);
+  const isDisabled = applicability.state !== 'ready';
 
   return (
-    <div className={`app-shell text-${textSize}`} style={{ '--reading-scale': READING_SCALES[textSize] || 1 }}>
-      <header className="topbar">
-        <a className="brand" href="#top" aria-label="PaperTrace home">
-          <span className="brand-mark" aria-hidden="true">PT</span>
-          <span>PaperTrace</span>
-        </a>
-        <div className="topbar-actions">
-          <button className="icon-button help-button" onClick={() => setShowHelp((value) => !value)} aria-label="About PaperTrace" title="About PaperTrace">
-            <CircleHelp size={18} />
-          </button>
-          {file && <button className="button button-primary button-small" onClick={() => fileInputRef.current?.click()}>
-            <FileUp size={16} /> <span>Change file</span>
-          </button>}
-          <input ref={fileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handleFileInput} aria-label="Choose a PDF or DOCX document" />
-        </div>
-      </header>
+    <article className={`pt-question ${isAnswered ? 'pt-question--answered' : ''} ${isDisabled ? 'pt-question--disabled' : ''}`}>
+      <div className="pt-question-top">
+        <span className="pt-question-number">{String(index + 1).padStart(2, '0')}</span>
+        <span className="pt-question-status">
+          {isAnswered ? <><CheckCircle2 size={14} /> Answered</> : applicability.state === 'waiting' ? 'Waiting' : applicability.state === 'not-applicable' ? 'Not applicable' : 'Needs answer'}
+        </span>
+      </div>
+      <h3>{node.question || `Requirement ${index + 1}`}</h3>
 
-      {showHelp && (
-        <div className="help-popover" role="status">
-          <strong>About PaperTrace</strong>
-          <p>AI suggests questions. Check the original before acting.</p>
-          <button className="text-button" onClick={() => setShowHelp(false)}>Close</button>
+      <details className="pt-source-details" open={node.compound_unit || undefined}>
+        <summary><Eye size={14} /> Original wording</summary>
+        <blockquote>{node.source_excerpt || 'No source excerpt was provided for this question.'}</blockquote>
+      </details>
+
+      {applicability.state !== 'ready' && (
+        <p className={`pt-applicability-note ${applicability.state === 'not-applicable' ? 'is-na' : ''}`}>
+          {applicability.reason}
+        </p>
+      )}
+
+      {node.response_type === 'text' ? (
+        <div className="pt-text-answer">
+          <label className="pt-sr-only" htmlFor={`answer-${node.id}`}>Your answer to question {index + 1}</label>
+          <input
+            id={`answer-${node.id}`}
+            type="text"
+            value={textInputVal !== undefined ? textInputVal : (answer || '')}
+            onChange={(event) => onTextChange(node.id, event.target.value)}
+            placeholder="Enter your answer…"
+            disabled={isDisabled}
+          />
+          <button
+            type="button"
+            className="pt-soft-button"
+            onClick={() => onTextSubmit(node.id)}
+            disabled={isDisabled || !(textInputVal || '').trim()}
+          >
+            Confirm
+          </button>
+        </div>
+      ) : (
+        <div className="pt-choice-list" role="group" aria-label={`Answer for question ${index + 1}`}>
+          {choices.map((choice) => (
+            <button
+              key={`${node.id}-${choice}`}
+              type="button"
+              className={`pt-choice ${String(answer) === String(choice) ? 'is-selected' : ''}`}
+              onClick={() => onAnswer(node.id, choice)}
+              aria-pressed={String(answer) === String(choice)}
+              disabled={isDisabled}
+            >
+              {choice}
+            </button>
+          ))}
         </div>
       )}
 
+      {isAnswered && nodeActions.length > 0 && (
+        <div className="pt-action-note">
+          <strong>Related actions</strong>
+          <ul>{nodeActions.map((action, actionIndex) => <li key={`${node.id}-action-${actionIndex}`}>{action}</li>)}</ul>
+        </div>
+      )}
+    </article>
+  );
+});
+
+/* =========================================================================
+   Main App Component
+   ========================================================================= */
+
+export default function App() {
+  const [file, setFile] = useState(null);
+  const [pdfUrl, setPdfUrl] = useState(null);
+  const [isDocx, setIsDocx] = useState(false);
+  const [treeData, setTreeData] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [textInputs, setTextInputs] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [leftWidth, setLeftWidth] = useState(46);
+  const [isResizing, setIsResizing] = useState(false);
+  const [zoomLevel, setZoomLevel] = useState(100);
+  const [textScale, setTextScale] = useState(100);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
+  const [dragActive, setDragActive] = useState(false);
+
+  const containerRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const rafRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+    };
+  }, [pdfUrl]);
+
+  // Optimized resize handling using requestAnimationFrame to eliminate layout lag
+  useEffect(() => {
+    if (!isResizing) return undefined;
+
+    const handlePointerMove = (event) => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(() => {
+        if (!containerRef.current) return;
+        const rect = containerRef.current.getBoundingClientRect();
+        if (!rect.width) return;
+        const percent = ((event.clientX - rect.left) / rect.width) * 100;
+        setLeftWidth(Math.max(28, Math.min(68, percent)));
+      });
+    };
+
+    const stopResize = () => {
+      setIsResizing(false);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [isResizing]);
+
+  const questionNodes = useMemo(() => sortNodeEntries(treeData?.nodes), [treeData]);
+  const answeredCount = questionNodes.filter((node) => {
+    const value = answers[node.id];
+    return value !== undefined && value !== null && String(value).trim() !== '';
+  }).length;
+  const progress = questionNodes.length ? (answeredCount / questionNodes.length) * 100 : 0;
+
+  const chooseFile = useCallback((selectedFile) => {
+    if (!selectedFile) return;
+    const lowerName = selectedFile.name.toLowerCase();
+    if (!lowerName.endsWith('.pdf') && !lowerName.endsWith('.docx')) {
+      setErrorMessage('Choose a PDF or DOCX file.');
+      return;
+    }
+
+    setErrorMessage('');
+    setStatusMessage('');
+    setFile(selectedFile);
+    setPdfUrl(URL.createObjectURL(selectedFile));
+    setIsDocx(lowerName.endsWith('.docx'));
+    setZoomLevel(100);
+    setTreeData(null);
+    setAnswers({});
+    setTextInputs({});
+  }, []);
+
+  const handleFileChange = useCallback((event) => {
+    chooseFile(event.target.files?.[0]);
+    event.target.value = '';
+  }, [chooseFile]);
+
+  const handleUpload = useCallback(async () => {
+    if (!file || loading) return;
+    setLoading(true);
+    setErrorMessage('');
+    setStatusMessage('Reading document…');
+
+    const formData = new FormData();
+    formData.append('files', file);
+
+    try {
+      const response = await axios.post(`${API_BASE}/parse-pdf`, formData);
+      setTreeData(response.data);
+      setAnswers({});
+      setTextInputs({});
+      const count = Object.keys(response.data?.nodes || {}).length;
+      setStatusMessage(count
+        ? `Ready to review · ${count} source-linked question${count === 1 ? '' : 's'}`
+        : 'Text extracted, but no questions passed verification.');
+    } catch (error) {
+      console.error('PaperTrace document parsing failed:', error);
+      const detail = error.response?.data?.detail;
+      setErrorMessage(
+        typeof detail === 'string'
+          ? detail
+          : 'Could not parse this document. Check that the FastAPI backend and Ollama are running, then try again.'
+      );
+      setStatusMessage('');
+    } finally {
+      setLoading(false);
+    }
+  }, [file, loading]);
+
+  const handleAnswer = useCallback((nodeId, answer) => {
+    setAnswers((previous) => ({ ...previous, [nodeId]: answer }));
+    setErrorMessage('');
+  }, []);
+
+  const handleTextChange = useCallback((nodeId, value) => {
+    setTextInputs((previous) => ({ ...previous, [nodeId]: value }));
+  }, []);
+
+  const handleTextInputSubmit = useCallback((nodeId) => {
+    const value = textInputs[nodeId];
+    if (!value || !value.trim()) return;
+    handleAnswer(nodeId, value.trim());
+  }, [textInputs, handleAnswer]);
+
+  const resetReview = useCallback(() => {
+    setTreeData(null);
+    setAnswers({});
+    setTextInputs({});
+    setErrorMessage('');
+    setStatusMessage('');
+    setShowModal(false);
+  }, []);
+
+  const downloadReport = useCallback(async () => {
+    if (!treeData) {
+      setErrorMessage('Parse a document before exporting a report.');
+      return;
+    }
+
+    setErrorMessage('');
+    setStatusMessage('Preparing review report…');
+    try {
+      const response = await axios.post(
+        `${API_BASE}/generate-filled-pdf`,
+        { answers, nodes: treeData.nodes || {} },
+        { responseType: 'blob' }
+      );
+      const url = window.URL.createObjectURL(new Blob([response.data], { type: 'application/pdf' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'PaperTrace_Review_Report.pdf';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      setStatusMessage('Review report downloaded. The original document is unchanged.');
+    } catch (error) {
+      console.error('PaperTrace report generation failed:', error);
+      setErrorMessage('Could not generate the report. Check that the FastAPI backend is running.');
+      setStatusMessage('');
+    }
+  }, [treeData, answers]);
+
+  const actions = useMemo(() => questionNodes.flatMap((node) => getNodeActions(node, answers[node.id])), [questionNodes, answers]);
+  const uniqueActions = useMemo(() => [...new Set(actions)], [actions]);
+
+  return (
+    <div
+      className="pt-app"
+      data-text-scale={textScale}
+      data-material="balanced"
+    >
+      <Header textScale={textScale} setTextScale={setTextScale} />
+
       <main
-        id="top"
-        ref={workspaceRef}
-        className={`workspace ${showSource ? '' : 'source-hidden'} ${isResizingPanels ? 'is-resizing-panels' : ''}`}
-        style={showSource ? { gridTemplateColumns: `minmax(0, ${leftPanelPercent}fr) 8px minmax(0, ${100 - leftPanelPercent}fr)` } : undefined}
+        className="pt-main"
+        ref={containerRef}
+        style={{ '--pt-left-width': `${leftWidth}%` }}
       >
-        <section className="work-column" aria-label="Guided document review">
-          <div className="page-heading">
-            <div>
-              <h1>Read the requirement.<br />Keep your footing.</h1>
-              <p className="page-subtitle">All questions in one list. Source stays visible.</p>
-            </div>
-            {treeData && <div className="saved-pill"><span className="saved-dot" /> {progressText}</div>}
-          </div>
+        <div className="pt-left-column">
+          <section className={`pt-intro ${dragActive ? 'pt-intro--dragging' : ''}`}>
+            <span className="pt-header-spark" aria-hidden="true">✦ </span>
+            <span> A clearer way through complex documents</span>
+            
+            <h1>Read the requirement. Keep your footing.</h1>
+            <p className="pt-lead">All questions in one list. Source stays visible.</p>
 
-          {!file ? (
-            <div
-              className="upload-card"
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={handleDrop}
-            >
-              <div className="upload-illustration"><FileUp size={29} strokeWidth={1.7} /></div>
-              <h2>Bring the document into focus.</h2>
-              <button className="button button-primary" onClick={() => fileInputRef.current?.click()}><FileUp size={17} /> Choose a document</button>
-              <div className="upload-or"><span /> or drop the file on this page <span /></div>
-              <div className="file-support"><span><Check size={14} /> PDF</span><span><Check size={14} /> DOCX</span><span>Up to 15 MB</span></div>
-              <div className="privacy-note"><LockKeyhole size={15} /> Sensitive file? Upload with care.</div>
-            </div>
-          ) : (
-            <div className="document-card">
-              <div className="file-icon"><FileText size={22} /></div>
-              <div className="document-meta">
-                <strong title={file.name}>{file.name}</strong>
-                <span>{isDocx ? 'Word document' : 'PDF document'} · {formatBytes(file.size)}</span>
+            <UploadSection
+              file={file}
+              loading={loading}
+              dragActive={dragActive}
+              setDragActive={setDragActive}
+              fileInputRef={fileInputRef}
+              chooseFile={chooseFile}
+              handleFileChange={handleFileChange}
+              handleUpload={handleUpload}
+            />
+
+            {file && (
+              <div className="pt-selected-file">
+                <FileText size={17} aria-hidden="true" />
+                <span className="pt-selected-filename" title={file.name}>{file.name}</span>
+                <span className="pt-file-size">
+                  {file.size < 1024 * 1024
+                    ? `${Math.max(1, Math.round(file.size / 1024))} KB`
+                    : `${(file.size / (1024 * 1024)).toFixed(1)} MB`}
+                </span>
+                <button type="button" className="pt-icon-button" onClick={() => { setFile(null); setPdfUrl(null); setIsDocx(false); resetReview(); }} aria-label="Remove selected document">
+                  <X size={15} />
+                </button>
               </div>
-              {treeData && <span className="file-status"><CheckCircle2 size={15} /> Loaded</span>}
-              {!treeData && <span className="file-status file-status-muted"><Clock3 size={15} /> Ready to review</span>}
-              <button className="icon-button" onClick={() => { setFile(null); setTreeData(null); setAnswers({}); setError(''); }} aria-label="Remove selected document" title="Remove document"><RotateCcw size={16} /></button>
+            )}
+
+            <div className="pt-file-hint">
+              <span className="pt-status-dot" aria-hidden="true" />
+              <span>PDF or DOCX · Up to 15 MB</span>
             </div>
-          )}
-
-          {file && !treeData && (
-            <div className="analyze-panel">
-              <div className="analyze-copy">
-                <Sparkles size={18} />
-                <div><strong>AI-guided review</strong><span>Check each suggestion against the source.</span></div>
-              </div>
-              <button className="button button-primary" onClick={analyzeDocument} disabled={loading}>
-                {loading ? <><LoaderCircle className="spin" size={17} /> Reading document…</> : <><Sparkles size={16} /> Start guided review <ArrowRight size={16} /></>}
-              </button>
-            </div>
-          )}
-
-          {error && <div className="alert alert-error" role="alert"><Info size={18} /><span>{error}</span><button className="alert-dismiss" aria-label="Dismiss message" onClick={() => setError('')}>×</button></div>}
-
-          {treeData?.generation_notice && ['review_fallback', 'ai_partial'].includes(treeData.question_generation_mode) && (
-            <div className="alert alert-warning" role="status">
-              <Info size={18} />
-              <span>
-                <strong>{treeData.question_generation_mode === 'ai_partial' ? 'Partial AI review.' : 'Manual review mode.'}</strong>{' '}
-                {treeData.generation_notice}
-              </span>
-            </div>
-          )}
-          {treeData?.text_truncated && (
-            <div className="alert alert-warning" role="status">
-              <Info size={18} />
-              <span>This document is longer than the current prototype can send to the AI at once. The questionnaire may not cover every section; check the entire original document.</span>
-            </div>
-          )}
-
-          {treeData && questions.length > 0 && (
-            <>
-              <div className="section-heading question-list-heading">
-                <div>
-                  <h2>Questions</h2>
-                  <p className="section-caption">Answer what you can. Change answers anytime.</p>
-                </div>
-                <div className="question-heading-actions">
-                  <span className="question-progress" aria-live="polite">{progressText}</span>
-                  <button className="text-button reset-link" onClick={resetAnswers}><RotateCcw size={14} /> Clear answers</button>
-                </div>
-              </div>
-
-              <form className="question-list" aria-label="Document questions" onSubmit={(event) => event.preventDefault()}>
-                {questions.map((node, index) => {
-                  const value = answers[node.id] ?? '';
-                  const isAnswered = String(value).trim().length > 0;
-                  const choices = node.choices || (node.targets ? Object.keys(node.targets) : ['Yes', 'No']);
-                  const questionId = `question-${node.id}`;
-                  const answerId = `answer-${node.id}`;
-                  return (
-                    <article className={`question-card question-list-item ${isAnswered ? 'is-answered' : 'is-unanswered'}`} key={node.id} aria-labelledby={questionId}>
-                      <div className="question-card-top">
-                        <span className="step-chip">QUESTION {String(index + 1).padStart(2, '0')}</span>
-                        <span className={`question-status ${isAnswered ? 'status-answered' : 'status-unanswered'}`}>
-                          {isAnswered ? <><Check size={13} /> Answered</> : 'Not answered'}
-                        </span>
-                      </div>
-                      <h3 id={questionId}>{node.question || `Review question ${index + 1}`}</h3>
-                      {node.source_excerpt && (
-                        <details className="source-quote">
-                          <summary><span><FileText size={15} /> View source wording</span><ChevronDown size={16} /></summary>
-                          <blockquote>{node.source_excerpt}</blockquote>
-                        </details>
-                      )}
-                      {node.response_type === 'text' ? (
-                        <div className="answer-field">
-                          <label htmlFor={answerId}>Your answer</label>
-                          <textarea
-                            id={answerId}
-                            rows={2}
-                            value={value}
-                            onChange={(event) => updateAnswer(node.id, event.target.value)}
-                            placeholder="Type your answer…"
-                          />
-                        </div>
-                      ) : (
-                        <fieldset className="choice-group">
-                          <legend>Choose one</legend>
-                          {choices.map((choice) => (
-                            <label key={choice} className={`choice-option ${value === choice ? 'is-selected' : ''}`}>
-                              <input
-                                type="radio"
-                                name={`answer-${node.id}`}
-                                value={choice}
-                                checked={value === choice}
-                                onChange={() => updateAnswer(node.id, choice)}
-                              />
-                              <span className="choice-indicator">{value === choice && <Check size={14} />}</span>
-                              <span className="choice-label">{choice}</span>
-                            </label>
-                          ))}
-                        </fieldset>
-                      )}
-                    </article>
-                  );
-                })}
-              </form>
-
-              <section className="answer-review" aria-labelledby="report-title">
-                <div className="answer-review-heading">
-                  <div><h3 id="report-title">Review report</h3></div>
-                  <span>{progressText}</span>
-                </div>
-                {allAnswered ? (
-                  <div className="completion-notice" role="status"><CheckCircle2 size={18} /> All listed questions answered. Check the original before export.</div>
-                ) : (
-                  <p className="answer-review-intro">Unanswered questions stay visible above.</p>
-                )}
-                {actionItems.length > 0 && (
-                  <div className="action-box"><div className="action-box-title"><Info size={16} /><strong>Suggested actions</strong></div><ul>{actionItems.map((action, index) => <li key={`${index}-${action}`}>{action}</li>)}</ul></div>
-                )}
-                <div className="report-row">
-                  <div><span>{progressText} · Original unchanged.</span></div>
-                  <button className="button button-primary report-download-button" onClick={downloadReport} disabled={answeredCount === 0 || downloading}>
-                    {downloading ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
-                    {downloading ? 'Preparing report…' : 'Download review report'}
+            
+            {treeData && (
+              <section className="pt-review">
+                <div className="pt-section-heading">
+                  <div>
+                    <h2>Review questions</h2>
+                    <p className="pt-muted">All questions in one list. Check the source before deciding.</p>
+                  </div>
+                  <button className="pt-text-button" type="button" onClick={resetReview}>
+                    <RotateCcw size={14} /> Start over
                   </button>
                 </div>
+
+                <div className="pt-progress-area">
+                  <div className="pt-progress-label">
+                    <span>{answeredCount} of {questionNodes.length} answered</span>
+                    <span>{Math.round(progress)}%</span>
+                  </div>
+                  <div className="pt-progress-track" role="progressbar" aria-label="Questions answered" aria-valuemin="0" aria-valuemax={questionNodes.length || 1} aria-valuenow={answeredCount}>
+                    <span style={{ width: `${progress}%` }} />
+                  </div>
+                </div>
+
+                <div className="pt-question-list">
+                  {questionNodes.map((node, index) => (
+                    <QuestionCard
+                      key={node.id}
+                      node={node}
+                      index={index}
+                      answer={answers[node.id]}
+                      textInputVal={textInputs[node.id]}
+                      onTextChange={handleTextChange}
+                      onTextSubmit={handleTextInputSubmit}
+                      onAnswer={handleAnswer}
+                      answers={answers}
+                    />
+                  ))}
+                </div>
+
+                <section className="pt-results">
+                  <div className="pt-results-heading">
+                    <h3>Review summary</h3>
+                    <span>{answeredCount} saved</span>
+                  </div>
+                  {uniqueActions.length > 0 && (
+                    <div className="pt-action-summary">
+                      <strong>Actions from your answers</strong>
+                      <ul>{uniqueActions.map((action, index) => <li key={`summary-action-${index}`}>{action}</li>)}</ul>
+                    </div>
+                  )}
+                  {answeredCount > 0 && (
+                    <button className="pt-soft-button pt-details-button" type="button" onClick={() => setShowModal(true)}>
+                      <Eye size={16} /> View answer details
+                    </button>
+                  )}
+                  <button className="pt-glass-button pt-report-button" type="button" onClick={downloadReport}>
+                    <Download size={17} /> Download review report
+                  </button>
+                </section>
               </section>
-            </>
-          )}
+            )}
 
-          {treeData && questions.length === 0 && (
-            <div className="empty-state-panel"><CircleHelp size={25} /><h2>No guided questions yet</h2><p>The document text may still be available in the source panel. Check the local AI service and try parsing again.</p><button className="button button-secondary" onClick={analyzeDocument} disabled={loading}>Try again</button></div>
-          )}
+            {errorMessage && (
+              <div className="pt-alert pt-alert--error" role="alert">
+                <AlertCircle size={17} />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+            {statusMessage && (
+              <div className="pt-status-message" role="status" aria-live="polite">
+                {statusMessage}
+              </div>
+            )}
+          </section>
+        </div>
 
-          <footer className="work-footer"><span>Prototype · Verify against the original.</span><button className="text-button" onClick={() => setShowSource((value) => !value)}>{showSource ? 'Hide source' : 'Show source'}</button></footer>
-        </section>
+        <div
+          className={`pt-divider ${isResizing ? 'pt-divider--active' : ''}`}
+          role="separator"
+          aria-label="Resize review and document panels"
+          aria-orientation="vertical"
+          aria-valuemin="28"
+          aria-valuemax="68"
+          aria-valuenow={Math.round(leftWidth)}
+          tabIndex={0}
+          onPointerDown={(event) => { event.preventDefault(); setIsResizing(true); }}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowLeft') setLeftWidth((value) => Math.max(28, value - 3));
+            if (event.key === 'ArrowRight') setLeftWidth((value) => Math.min(68, value + 3));
+            if (event.key === 'Home') setLeftWidth(28);
+            if (event.key === 'End') setLeftWidth(68);
+            if (event.key === 'Enter') setLeftWidth(46);
+          }}
+          title="Drag to resize. Use arrow keys to adjust; Enter resets."
+        >
+          <span />
+        </div>
 
-        {showSource && (
-          <div
-            className="panel-divider"
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize review and source panels"
-            aria-valuemin={38}
-            aria-valuemax={62}
-            aria-valuenow={leftPanelPercent}
-            aria-valuetext={`Review panel ${leftPanelPercent} percent; source panel ${100 - leftPanelPercent} percent`}
-            tabIndex={0}
-            onPointerDown={startPanelResize}
-            onPointerMove={movePanelDivider}
-            onPointerUp={finishPanelResize}
-            onPointerCancel={finishPanelResize}
-            onLostPointerCapture={finishPanelResize}
-            onKeyDown={resizePanelsWithKeyboard}
-            onDoubleClick={() => setLeftPanelPercent(48)}
-            title="Drag to resize. Use arrow keys to adjust; press Enter to reset."
-          >
-            <span aria-hidden="true" />
-          </div>
-        )}
-
-        {showSource && (
-          <aside className="source-column" aria-label="Original document preview">
-            <div className="source-header">
-              <div><h2>Original document</h2></div>
-              {file && !isDocx && <div className="zoom-controls"><button className="icon-button" onClick={() => setZoomLevel((value) => Math.max(50, value - 10))} title="Zoom out" aria-label="Zoom out"><ZoomOut size={16} /></button><span>{zoomLevel}%</span><button className="icon-button" onClick={() => setZoomLevel((value) => Math.min(200, value + 10))} title="Zoom in" aria-label="Zoom in"><ZoomIn size={16} /></button></div>}
+        <section className="pt-workspace" aria-label="Original document preview">
+          <div className="pt-panel-head">
+            <div>
+              <h2>Original document</h2>
+              <p className="pt-panel-caption">{file ? file.name : 'Your source stays visible here.'}</p>
             </div>
-            <div className="source-file-label">{file ? <><FileText size={15} /><span title={file.name}>{file.name}</span></> : <><FileText size={15} /><span>Preview will appear here</span></>}</div>
-            <div className="source-viewer">
+            {!isDocx && file && (
+              <div className="pt-zoom-controls" aria-label="PDF zoom controls">
+                <button className="pt-icon-button" type="button" onClick={() => setZoomLevel((value) => Math.max(50, value - 15))} aria-label="Zoom out">
+                  <ZoomOut size={16} />
+                </button>
+                <span>{zoomLevel}%</span>
+                <button className="pt-icon-button" type="button" onClick={() => setZoomLevel((value) => Math.min(250, value + 15))} aria-label="Zoom in">
+                  <ZoomIn size={16} />
+                </button>
+                <button className="pt-text-button" type="button" onClick={() => setZoomLevel(100)}>Reset</button>
+              </div>
+            )}
+          </div>
+
+          <div className="pt-document-frame">
+            <div className="pt-document-toolbar">
+              <span className="pt-toolbar-filename">{file ? file.name : 'PREVIEW WILL APPEAR HERE'}</span>
+              {file && <span className="pt-toolbar-state">Local preview</span>}
+            </div>
+            <div className="pt-document-body">
               {!file ? (
-                <div className="source-empty"><div><FileText size={28} /><span>Your document appears here.</span><small>PDF or DOCX</small></div></div>
+                <div className="pt-preview-empty">
+                  <div className="pt-empty-icon"><FileText size={26} /></div>
+                  <h3>Your document appears here.</h3>
+                  <p>Choose a PDF or DOCX to keep the original beside your review.</p>
+                </div>
               ) : isDocx ? (
-                <div className="docx-preview">
-                  <div className="docx-page-label">DOCUMENT TEXT</div>
-                  {treeData?.text_preview ? <pre>{treeData.text_preview}</pre> : <div className="preview-prompt">Start the guided review to extract the text from this Word document.</div>}
+                <div className="pt-docx-preview">
+                  {treeData?.text_preview || 'Click “Start review” to extract the Word document text.'}
                 </div>
               ) : (
-                <iframe key={`${pdfUrl}-${zoomLevel}`} title="Original PDF document preview" src={`${pdfUrl}#toolbar=0&navpanes=0&zoom=${zoomLevel}`} />
+                <iframe
+                  key={`${pdfUrl}-${zoomLevel}`}
+                  src={`${pdfUrl}#zoom=${zoomLevel}&toolbar=0`}
+                  title="PDF source preview"
+                  className="pt-pdf-frame"
+                />
               )}
             </div>
-            <div className="source-footer"><LockKeyhole size={13} /><span>Original unchanged · Export is separate.</span></div>
-          </aside>
-        )}
+          </div>
+        </section>
       </main>
 
-      <div className="accessibility-toolbar" role="group" aria-label="Interface text size">
-        <span>Text size</span>
-        <button className={textSize === 'normal' ? 'active' : ''} onClick={() => setTextSize('normal')} aria-label="Text size 100 percent (default)" title="Text size 100 percent (default)" aria-pressed={textSize === 'normal'}>100%</button>
-        <button className={textSize === 'large' ? 'active' : ''} onClick={() => setTextSize('large')} aria-label="Text size 200 percent (twice the default size)" title="Text size 200 percent (twice the default size)" aria-pressed={textSize === 'large'}>200%</button>
-        <button className={textSize === 'xlarge' ? 'active' : ''} onClick={() => setTextSize('xlarge')} aria-label="Text size 300 percent (three times the default size)" title="Text size 300 percent (three times the default size)" aria-pressed={textSize === 'xlarge'}>300%</button>
-      </div>
+      {showModal && (
+        <div className="pt-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowModal(false); }}>
+          <section className="pt-modal" role="dialog" aria-modal="true" aria-labelledby="pt-modal-title">
+            <header className="pt-modal-heading">
+              <div>
+                <p className="pt-eyebrow">PaperTrace</p>
+                <h2 id="pt-modal-title">Answer details</h2>
+              </div>
+              <button type="button" className="pt-icon-button" onClick={() => setShowModal(false)} aria-label="Close details"><X size={17} /></button>
+            </header>
+            <p className="pt-muted">{treeData?.document_title || file?.name}. Answers shown here are your selections, not a compliance certification.</p>
+            <div className="pt-modal-list">
+              {questionNodes.map((node, index) => (
+                <article key={`modal-${node.id}`} className="pt-modal-item">
+                  <h3>{index + 1}. {node.question}</h3>
+                  <blockquote>{node.source_excerpt || 'No source excerpt.'}</blockquote>
+                  <p><strong>Answer:</strong> {answers[node.id] === undefined ? 'Not answered' : String(answers[node.id])}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
